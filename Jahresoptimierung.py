@@ -54,6 +54,7 @@ preise = preise.resample('15Min').ffill()
 
 
 t1 = clock()
+#Change investigated charges here (from, to)
 for p in range(210,300):
     
     ##Base data
