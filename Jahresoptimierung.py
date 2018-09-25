@@ -1,7 +1,7 @@
 
 # coding: utf-8
 
-# In[16]:
+# In[1]:
 
 
 #Importieren von Bibliotheken
@@ -17,7 +17,7 @@ from time import *
 get_ipython().run_line_magic('matplotlib', 'inline')
 
 
-# In[17]:
+# In[2]:
 
 
 #Ablageort von Dateien
@@ -25,7 +25,7 @@ get_ipython().run_line_magic('matplotlib', 'inline')
 directory = 'C:/Users/rominger/Documents/rominger/1 BMW Projekt/02 Flexvermarktung/Vermarktung Ladeinfrastruktur/Garching/Intraday-Market/'
 
 
-# In[18]:
+# In[3]:
 
 
 #Einlesen von Ladedaten
@@ -38,7 +38,7 @@ EV_data["trades [#]"]=0
 EV_data["Initialer SOC [kWh]"] = EV_data["Finaler SOC [kWh]"] - EV_data["Energie [kWh]"]
 
 
-# In[19]:
+# In[4]:
 
 
 file2 = directory + 'tx_15_16_17_quarterly_forecast.csv'
@@ -50,26 +50,29 @@ preise = preise.set_index('trading_timestamp')
 preise = preise.resample('15Min').ffill()
 
 
-# In[ ]:
+# In[5]:
 
 
 t1 = clock()
-#Change investigated charges here (from, to)
-for p in range(210,300):
+for p in range(278,279):
     
     ##Base data
     #Capacity of battery in kWh
     kap_speicher = EV_data["Kapazitaet [kWh]"][p]
-    #Maximum power
+    #Maximum power charge
     max_power = EV_data['Leistung [kW]'][p]
-    #Minimum power 
-    min_power = -EV_data['Leistung [kW]'][p]
+    #Minimum power charge
+    min_power = 3.6
+    #Maximum power discharge
+    neg_max_power = -3.6
+    #Minimum power discharge
+    neg_min_power = -EV_data['Leistung [kW]'][p]
     #Initial soc
     init_speicher = EV_data['Initialer SOC [kWh]'][p]
     #Final soc
     fSOC = EV_data["Finaler SOC [kWh]"][p]
     #Lead time [15-min.-intervalls]
-    leadtime=12*4
+    leadtime=4*4
     #Horizon of optimization [15-min.-intervalls]
     horizon = int((EV_data['Ende_15'][p]-EV_data['Start_15'][p])/datetime.timedelta(hours=1)*4)
     if horizon <= 2:
@@ -84,6 +87,8 @@ for p in range(210,300):
     prognosezeitpunkt = start_time - datetime.timedelta(hours=leadtime/4)
     #End Time of charge
     end_time = EV_data['Ende_15'][p] 
+    #trading fee per MWh
+    trading_fee = 0.09
     
     ##Create price data for time slot of interest
     #Select Price data from Intraday market for forecast and charge
@@ -159,48 +164,53 @@ for p in range(210,300):
     model.preis_exis = Param(model.t)
 
     #Variables of the abstract model (= decision variables)
-    model.p_buy = Var(model.t, domain = Reals, bounds = (0, max_power-min_power), initialize=0)
-    model.p_sell = Var(model.t, domain = Reals, bounds = (min_power-max_power, 0), initialize=0)
+    model.p_buy = Var(model.t, domain = Reals, bounds = (0, max_power-neg_min_power), initialize=0)
+    model.p_sell = Var(model.t, domain = Reals, bounds = (neg_min_power-max_power, 0), initialize=0)
     model.soc = Var(model.t, domain= NonNegativeReals, bounds = (0, kap_speicher), initialize = 0)
-    model.p_result_pos = Var(model.t, domain = Reals, bounds = (0, max_power), initialize=0)
-    model.p_result_neg = Var(model.t, domain = Reals, bounds = (min_power, 0), initialize=0)
+    model.p_result_pos = Var(model.t, domain = NonNegativeReals, initialize=0)
+    model.p_result_neg = Var(model.t, domain = NonPositiveReals, initialize=0)
     model.buy =Var(model.t, domain = Binary)
     model.sell =Var(model.t, domain = Binary)
+    model.charge = Var(model.t, domain = Binary)
+    model.discharge = Var(model.t, domain = Binary)
 
     #Objective function of the abstract model
     def obj_expression(model):
-        return 1/4*1/1000*sum(model.p_buy[t]*model.preis_buysell[t] + model.p_sell[t]*model.preis_buysell[t] for t in model.t)
+        return 1/4*1/1000*sum(model.p_buy[t]*model.preis_buysell[t] + model.p_sell[t]*model.preis_buysell[t] + model.buy[t]*trading_fee + model.sell[t]*trading_fee for t in model.t)
     model.OBJ = Objective(rule=obj_expression)
 
     #Schedule of EV 
     def resulting_power_rule(model,t):
-        return model.p_result_pos[t] + model.p_result_neg[t]  == model.p_supply[t]+model.p_buy[t]+model.p_withdraw[t]+model.p_sell[t]
+        if t == horizon-1:
+            return model.p_result_pos[t] + model.p_result_neg[t] == 0
+        else:
+            return model.p_result_pos[t] + model.p_result_neg[t]  == model.p_supply[t]+model.p_buy[t]+model.p_withdraw[t]+model.p_sell[t]
     model.resulting_power_rule = Constraint(model.t, rule=resulting_power_rule)
 
     #Binary variable buy to avoid buying and selling in same time step
     def buy_rule(model,t):
-        if t == 0:
+        if t == horizon-1:
             return model.p_buy[t] == 0
         else:
-            return model.p_buy[t] <= model.buy[t]*(max_power-min_power)
+            return model.p_buy[t] <= model.buy[t]*(max_power-neg_min_power)
     model.buy_rule = Constraint(model.t, rule=buy_rule)
 
     #Binary variable sell to avoid buying and selling in same time step
     def sell_rule(model,t):
-        if t == 0:
+        if t == horizon-1:
             return model.p_sell[t] == 0
         else:
-            return model.p_sell[t] >= model.sell[t]*(min_power-max_power)
+            return model.p_sell[t] >= model.sell[t]*(neg_min_power-max_power)
     model.sell_rule = Constraint(model.t, rule=sell_rule)
     
     #binary variable buy II to avoid trading if no trade existed
     def buy_rule2(model,t):
-        return model.p_buy[t] <= model.preis_exis[t]*(max_power-min_power)
+        return model.p_buy[t] <= model.preis_exis[t]*(max_power-neg_min_power)
     model.buy_rule2 = Constraint(model.t, rule=buy_rule2)
 
     #binary variable sell II to avoid trading if no trade existed
     def sell_rule2(model,t):
-        return model.p_sell[t] >= model.preis_exis[t]*(min_power-max_power)
+        return model.p_sell[t] >= model.preis_exis[t]*(neg_min_power-max_power)
     model.sell_rule2 = Constraint(model.t, rule=sell_rule2)
     
     #constraint to avoid buying and selling in same time step
@@ -208,12 +218,32 @@ for p in range(210,300):
         return model.buy[t]+model.sell[t] <= 1
     model.buysell_rule = Constraint(model.t, rule=buysell_rule)
 
+    #binary variable to limit minimum charging
+    def charge_rule(model,t):
+        return model.p_result_pos[t] >= model.charge[t]*min_power
+    model.charge_rule = Constraint(model.t, rule=charge_rule)
+    
+    #binary variable to limit maximum charging
+    def charge_rule2(model,t):
+        return model.p_result_pos[t] <= model.charge[t]*max_power
+    model.charge_rule2 = Constraint(model.t, rule=charge_rule2)
+    
+    #binary variable to limit minimum discharging 
+    def discharge_rule(model,t):
+        return model.p_result_neg[t] <= model.discharge[t]*neg_max_power
+    model.discharge_rule = Constraint(model.t, rule=discharge_rule)
+    
+    #binary variable to limit maximum discharging
+    def discharge_rule2(model,t):
+        return model.p_result_neg[t] >= model.discharge[t]*neg_min_power
+    model.discharge_rule2 = Constraint(model.t, rule=discharge_rule2)
+    
     #EV SOC
     def soc_rule(model,t):
         if t == 0:
             return model.soc[t] == model.energy_need[t]
         if t >= 1 and t <= horizon:
-            return model.soc[t] == model.soc[t-1]+1/4*model.p_result_pos[t]*ladewirkungsgrad+1/4*model.p_result_neg[t]/entladewirkungsgrad
+            return model.soc[t] == model.soc[t-1]+1/4*model.p_result_pos[t-1]*ladewirkungsgrad+1/4*model.p_result_neg[t-1]/entladewirkungsgrad
         return Constraint.Skip
     model.soc_rule = Constraint(model.t, rule=soc_rule)
 
@@ -303,7 +333,7 @@ for p in range(210,300):
     #Plot
     fig, ax1 = plt.subplots()
     ax1 = primary.plot(x = 'Date', figsize=(13,6.5))
-    ax2 = secondary.plot(x = 'Date', secondary_y=True, ylim =(min_power,max(kap_speicher, max_power)+1), ax=ax1)
+    ax2 = secondary.plot(x = 'Date', secondary_y=True, ylim =(neg_min_power,max(kap_speicher, max_power)+1), ax=ax1)
     tertiary.plot(x = 'Date',kind='bar',ax=ax1)
     ax2.set_ylim(min_price,max_price)
     title = "Intitialoptimierung vor dem Ladevorgang um " + str(corr_price_data.index[0])
@@ -313,7 +343,7 @@ for p in range(210,300):
     ax2.set_ylabel('Preis [€/MWh]', fontsize = 16)
     #Plot von horizontalen Achsen
     ax1.axhline(y = 0, color = "k")
-    ax2.axhline(y = 0, color = "k")
+    ax2.axhline(y = 0, color = "b")
     #Legendenplot
     ax1.legend(bbox_to_anchor=(0,1.05,1,0.15), loc="lower left", mode="expand", borderaxespad=0, ncol=5)
     ax2.legend(bbox_to_anchor=(0,1.10,1,0.1), loc="lower left", mode="expand", borderaxespad=0, ncol=5)
@@ -438,7 +468,7 @@ for p in range(210,300):
         #Plot
         fig, ax1 = plt.subplots()
         ax1 = primary.plot(x = 'Date',figsize=(13,6.5))
-        ax2 = secondary.plot(x = 'Date', secondary_y=True, ylim =(min_power,max(kap_speicher, max_power)+1), ax=ax1)
+        ax2 = secondary.plot(x = 'Date', secondary_y=True, ylim =(neg_min_power,max(kap_speicher, max_power)+1), ax=ax1)
         ax2.set_ylim(min_price,max_price)
         tertiary.plot(x = 'Date', kind='bar',ax=ax1)
         title = "Optimierung vor dem Ladevorgang um " + str(corr_price_data.index[0])
@@ -447,7 +477,7 @@ for p in range(210,300):
         ax1.set_ylabel('Leistung [kW]/ Energie [kWh]', fontsize = 16)
         ax2.set_ylabel('Preis [€/MWh]', fontsize = 16)
         ax1.axhline(y = 0, color = "k")
-        ax2.axhline(y = 0, color = "k")
+        ax2.axhline(y = 0, color = "b")
         ax1.legend(bbox_to_anchor=(0,1.05,1,0.15), loc="lower left", mode="expand", borderaxespad=0, ncol=5)
         ax2.legend(bbox_to_anchor=(0,1.10,1,0.1), loc="lower left", mode="expand", borderaxespad=0, ncol=5)
         fname = 'figure' + str("%02d" % i)
@@ -463,7 +493,6 @@ for p in range(210,300):
     ##Optimization during charge
     for j in range(1,horizon):
         energy_need.loc[0,'energy']= results_power["Energy [kWh]"][1]
-        preise_supply = preise_supply[:-1]
         p_supply = p_supply[:-1]
         p_withdraw = p_withdraw[:-1]
         preise_buysell = preise_buysell[:-1]
@@ -560,7 +589,7 @@ for p in range(210,300):
         realized_power['Date']= zeitreihe[:j].index.copy()
         realized_power['Date']=realized_power['Date'].apply(lambda x: x.strftime('%H:%M'))
         realized_power = realized_power.rename(columns={0: "Resulting Power [kW]", 1: "Energy [kWh]"})
-        final_power = pd.concat([realized_power, results_power])
+        final_power = pd.concat([realized_power, results_power], sort=False)
         primary = final_power[['Date','Resulting Power [kW] (Old)','Resulting Power [kW]','Energy [kWh]']].copy()
         primary = primary.rename(columns={"Resulting Power [kW]": "Aktueller Fahrplan [kW]", "Resulting Power [kW] (Old)": "Vorheriger Fahrplan [kW]", "Energy [kWh]": "SOC [kWh]"})
         secondary = final_power[['Date','Current Price [EUR/MWh]']].copy()
@@ -569,17 +598,17 @@ for p in range(210,300):
         tertiary= tertiary.rename(columns={"Power Buy [kW]": "Einkauf [kW]", "Power Sell [kW]": "Verkauf [kW]"})
         fig, ax1 = plt.subplots()
         ax1 = primary.plot(x = 'Date',figsize=(13,6.5))
-        ax2 = secondary.plot(x = 'Date', secondary_y=True, ylim =(min_power,max(kap_speicher, max_power)+1), ax=ax1)
+        ax2 = secondary.plot(x = 'Date', secondary_y=True, ylim =(neg_min_power,max(kap_speicher, max_power)+1), ax=ax1)
         tertiary.plot(x = 'Date',kind='bar',ax=ax1)
         ax2.set_ylim(min_price,max_price)
-        plt.axvline(x=j, color ='k', linewidth=2)
+        plt.axvline(x=j-1, color ='k', linewidth=2)
         title = "Optimierung während des Ladevorgangs um " + str(corr_price_data.index[0])
         plt.title(title)
         ax1.set_xlabel('Ladevorgang', fontsize = 16)
         ax1.set_ylabel('Leistung [kW]/ Energie [kWh]', fontsize = 16)
         ax2.set_ylabel('Preis [€/MWh]', fontsize = 16)
         ax1.axhline(y = 0, color = "k")
-        ax2.axhline(y = 0, color = "k")
+        ax2.axhline(y = 0, color = "b")
         ax1.legend(bbox_to_anchor=(0,1.05,1,0.15), loc="lower left", mode="expand", borderaxespad=0, ncol=5)
         ax2.legend(bbox_to_anchor=(0,1.10,1,0.1), loc="lower left", mode="expand", borderaxespad=0, ncol=5)
         #plt.xticks(primary.index)
@@ -607,8 +636,14 @@ dt = t2 - t1
 dt
 
 
-# In[17]:
+# In[6]:
 
 
-sum(price_data.index == prognosezeitpunkt)
+EV_data.to_csv("Ergebnisse.csv")
+
+
+# In[7]:
+
+
+EV_data[278:279]
 
